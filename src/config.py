@@ -1033,6 +1033,10 @@ class Config:
     market_review_color_scheme: str = "green_up"
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
+    # 每日 K 线增量更新（全部 A 股，非仅自选；定时任务模式的后台任务）
+    daily_kline_update_enabled: bool = True
+    # 每周股票名称索引更新（基于 akshare，定时任务模式的后台任务）
+    weekly_stock_index_update_enabled: bool = True
 
     # === 实时行情增强数据配置 ===
     # 实时行情开关（关闭后使用历史收盘价进行分析）

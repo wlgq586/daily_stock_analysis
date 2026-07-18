@@ -74,6 +74,26 @@ class KLineData(BaseModel):
     })
 
 
+class StockListItem(BaseModel):
+    """股票列表项"""
+
+    code: str = Field(..., description="股票代码")
+    name: Optional[str] = Field(None, description="股票名称")
+    data_count: int = Field(0, description="K 线数据条数")
+    first_date: Optional[str] = Field(None, description="最早数据日期")
+    last_date: Optional[str] = Field(None, description="最新数据日期")
+
+
+class StockListResponse(BaseModel):
+    """股票列表响应"""
+
+    total: int = Field(..., description="股票总数")
+    page: int = Field(1, description="当前页码")
+    page_size: int = Field(50, description="每页条数")
+    total_pages: int = Field(1, description="总页数")
+    stocks: List[StockListItem] = Field(default_factory=list, description="股票列表")
+
+
 class ExtractItem(BaseModel):
     """单条提取结果（代码、名称、置信度）"""
 

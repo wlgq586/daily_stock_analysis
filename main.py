@@ -1235,6 +1235,113 @@ def _build_schedule_times_provider(default_schedule_time: str):
     return _provider
 
 
+def _build_maintenance_background_tasks(config: Config) -> list:
+    """Build the list of background maintenance tasks (K-line + stock index).
+
+    Shared between the CLI --schedule path and the desktop --serve-only path
+    so that desktop users also get automatic data maintenance.
+    """
+    tasks = []
+
+    # 每日 K 线增量更新（全部 A 股，非仅自选）
+    if getattr(config, 'daily_kline_update_enabled', True):
+        _kline_script = str(
+            Path(__file__).parent / "scripts" / "fetch_all_ashare_kline.py"
+        )
+
+        def daily_kline_update():
+            import subprocess
+            try:
+                logger.info("[K线更新] 开始每日增量 K 线更新...")
+                result = subprocess.run(
+                    [sys.executable, _kline_script, "--update-recent", "5"],
+                    capture_output=True, text=True, timeout=7200,
+                    cwd=str(Path(__file__).parent),
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().splitlines()
+                    for line in lines[-10:]:
+                        logger.info(f"[K线更新] {line}")
+                else:
+                    logger.error(f"[K线更新] 失败 (exit={result.returncode}): {result.stderr[:500]}")
+            except subprocess.TimeoutExpired:
+                logger.error("[K线更新] 超时（超过 2 小时）")
+            except Exception as e:
+                logger.error(f"[K线更新] 异常: {e}")
+
+        tasks.append({
+            "task": daily_kline_update,
+            "interval_seconds": 86400,  # 24 小时
+            "run_immediately": False,
+            "name": "daily_kline_update",
+        })
+
+    # 每周股票名称索引更新
+    if getattr(config, 'weekly_stock_index_update_enabled', True):
+        _index_script = str(
+            Path(__file__).parent / "scripts" / "update_stock_index.py"
+        )
+
+        def weekly_stock_index_update():
+            import subprocess
+            try:
+                logger.info("[索引更新] 开始更新股票名称索引...")
+                result = subprocess.run(
+                    [sys.executable, _index_script],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=str(Path(__file__).parent),
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().splitlines()[-5:]:
+                        logger.info(f"[索引更新] {line}")
+                else:
+                    logger.error(f"[索引更新] 失败: {result.stderr[:300]}")
+            except Exception as e:
+                logger.error(f"[索引更新] 异常: {e}")
+
+        tasks.append({
+            "task": weekly_stock_index_update,
+            "interval_seconds": 604800,  # 7 天
+            "run_immediately": True,
+            "name": "weekly_stock_index_update",
+        })
+
+    return tasks
+
+
+def _start_desktop_maintenance_tasks(config: Config) -> None:
+    """Start background maintenance tasks for desktop mode.
+
+    Launches a daemon scheduler thread that only runs the maintenance
+    background tasks (K-line + stock index update) without a scheduled
+    daily analysis task.
+    """
+    tasks = _build_maintenance_background_tasks(config)
+    if not tasks:
+        logger.info("[桌面维护] 没有启用的后台维护任务，跳过")
+        return
+
+    from src.scheduler import Scheduler
+
+    scheduler = Scheduler(register_signals=False)
+    for entry in tasks:
+        scheduler.add_background_task(
+            task=entry["task"],
+            interval_seconds=entry["interval_seconds"],
+            run_immediately=entry.get("run_immediately", False),
+            name=entry.get("name"),
+        )
+
+    logger.info(
+        "[桌面维护] 启动后台维护任务（%s），K线每日增量更新 + 索引每周更新",
+        ", ".join(t.get("name", "?") for t in tasks),
+    )
+
+    import threading
+    thread = threading.Thread(target=scheduler.run, daemon=True, name="desktop-maintenance")
+    thread.start()
+
+
 def main() -> int:
     """
     主入口函数
@@ -1380,6 +1487,11 @@ def main() -> int:
         logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
         logger.info("通过 /api/v1/analysis/analyze 接口触发分析")
         logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
+
+        # 桌面模式下启动后台维护任务（K线更新 + 股票索引更新）
+        if os.getenv("DSA_DESKTOP_MODE", "").strip().lower() == "true":
+            _start_desktop_maintenance_tasks(config)
+
         logger.info("按 Ctrl+C 退出...")
         try:
             while True:
@@ -1495,6 +1607,9 @@ def main() -> int:
                     "run_immediately": True,
                     "name": "agent_event_monitor",
                 })
+
+            # 每日 K 线增量更新 + 每周索引更新（复用维护任务构建函数）
+            background_tasks.extend(_build_maintenance_background_tasks(config))
 
             schedule_kwargs = {
                 "task": scheduled_task,

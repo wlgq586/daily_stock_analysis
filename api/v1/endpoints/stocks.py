@@ -12,18 +12,23 @@
 """
 
 import logging
+import math
 from typing import Optional
 import re
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, Depends
+from sqlalchemy import func, distinct
+from sqlalchemy.orm import Session
 
-from api.deps import get_system_config_service
+from api.deps import get_db, get_system_config_service
 
 from api.v1.schemas.stocks import (
     ExtractFromImageResponse,
     ExtractItem,
     KLineData,
     StockHistoryResponse,
+    StockListItem,
+    StockListResponse,
     StockQuote,
 )
 from api.v1.schemas.history import WatchlistRequest, WatchlistResponse
@@ -41,6 +46,9 @@ from src.services.import_parser import (
 from src.services.stock_service import StockService
 from src.services.stock_list_parser import split_stock_list
 from src.services.system_config_service import SystemConfigService
+from src.data.stock_mapping import STOCK_NAME_MAP
+from src.data.stock_index_loader import get_index_stock_name
+from src.storage import StockDaily
 from data_provider.base import normalize_stock_code
 
 logger = logging.getLogger(__name__)
@@ -401,7 +409,192 @@ def remove_from_watchlist(
         logger.error(f"从自选删除失败: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"从自选删除失败: {str(e)}"},
+            detail={"error": "internal_error", "message": f"从自选删除失败: {str(e)}"}
+        )
+
+
+@router.get(
+    "/",
+    response_model=StockListResponse,
+    responses={
+        200: {"description": "股票列表"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取股票列表",
+    description="返回数据库中所有 A 股股票的代码、名称、K 线数据覆盖范围。",
+)
+def list_stocks(
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(50, ge=1, le=200, description="每页条数"),
+    search: Optional[str] = Query(None, description="搜索关键词（代码或名称）"),
+) -> StockListResponse:
+    """
+    获取数据库中所有 A 股股票的列表（分页）
+
+    从 stock_daily 表中查询所有不同的股票代码，并返回每只股票的名称、
+    数据条数和日期范围。支持按代码或名称搜索。
+
+    Returns:
+        StockListResponse: 股票列表（含分页信息）
+    """
+    try:
+        # 查询每只股票的统计信息
+        base_query = (
+            db.query(
+                StockDaily.code,
+                func.count(StockDaily.id).label("data_count"),
+                func.min(StockDaily.date).label("first_date"),
+                func.max(StockDaily.date).label("last_date"),
+            )
+            .group_by(StockDaily.code)
+        )
+
+        # 获取总数（需要子查询方式处理 group_by 计数）
+        count_subq = base_query.subquery()
+        total = db.query(func.count()).select_from(count_subq).scalar() or 0
+
+        # 获取所有聚合结果（用于名称匹配过滤）
+        all_rows = base_query.order_by(StockDaily.code).all()
+
+        # 构建带名称的列表
+        all_stocks = []
+        for row in all_rows:
+            code = str(row.code)
+            name = STOCK_NAME_MAP.get(code) or get_index_stock_name(code)
+            all_stocks.append((
+                code,
+                name,
+                row.data_count,
+                str(row.first_date) if row.first_date else None,
+                str(row.last_date) if row.last_date else None,
+            ))
+
+        # 搜索过滤
+        if search:
+            keyword = search.strip().lower()
+            all_stocks = [
+                s for s in all_stocks
+                if keyword in s[0].lower() or (s[1] and keyword in s[1].lower())
+            ]
+            total = len(all_stocks)
+
+        # 分页
+        total_pages = max(1, math.ceil(total / page_size))
+        offset = (page - 1) * page_size
+        page_rows = all_stocks[offset : offset + page_size]
+
+        stocks = [
+            StockListItem(
+                code=code,
+                name=name,
+                data_count=data_count,
+                first_date=first_date,
+                last_date=last_date,
+            )
+            for code, name, data_count, first_date, last_date in page_rows
+        ]
+
+        return StockListResponse(
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+            stocks=stocks,
+        )
+
+    except Exception as e:
+        logger.error(f"获取股票列表失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取股票列表失败: {str(e)}"
+            }
+        )
+
+
+@router.get(
+    "/{stock_code}/kline",
+    response_model=StockHistoryResponse,
+    responses={
+        200: {"description": "K 线数据"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="从数据库获取股票 K 线数据",
+    description="直接从数据库读取指定股票的 K 线数据，支持日期范围筛选。",
+)
+def get_stock_kline(
+    stock_code: str,
+    start_date: Optional[str] = Query(None, description="起始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+) -> StockHistoryResponse:
+    """
+    从数据库获取股票 K 线数据
+
+    直接从 stock_daily 表读取 K 线数据，避免实时抓取。
+
+    Args:
+        stock_code: 股票代码
+        start_date: 起始日期（可选）
+        end_date: 结束日期（可选）
+
+    Returns:
+        StockHistoryResponse: K 线数据
+    """
+    try:
+        query = (
+            db.query(StockDaily)
+            .filter(StockDaily.code == stock_code)
+            .order_by(StockDaily.date.asc())
+        )
+
+        if start_date:
+            query = query.filter(StockDaily.date >= start_date)
+        if end_date:
+            query = query.filter(StockDaily.date <= end_date)
+
+        rows = query.all()
+
+        if not rows:
+            return StockHistoryResponse(
+                stock_code=stock_code,
+                stock_name=STOCK_NAME_MAP.get(stock_code) or get_index_stock_name(stock_code),
+                period="daily",
+                data=[],
+            )
+
+        stock_name = STOCK_NAME_MAP.get(stock_code) or get_index_stock_name(stock_code)
+        data = [
+            KLineData(
+                date=str(row.date),
+                open=float(row.open) if row.open else 0,
+                high=float(row.high) if row.high else 0,
+                low=float(row.low) if row.low else 0,
+                close=float(row.close) if row.close else 0,
+                volume=float(row.volume) if row.volume else None,
+                amount=float(row.amount) if row.amount else None,
+                change_percent=float(row.pct_chg) if row.pct_chg else None,
+            )
+            for row in rows
+        ]
+
+        return StockHistoryResponse(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            period="daily",
+            data=data,
+        )
+
+    except Exception as e:
+        logger.error(f"获取 K 线数据失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取 K 线数据失败: {str(e)}"
+            }
         )
 
 
