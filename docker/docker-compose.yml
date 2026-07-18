@@ -22,9 +22,9 @@ x-common: &common
     - ../.env
 
   volumes:
-    - ../data:/app/data
-    - ../logs:/app/logs
-    - ../reports:/app/reports
+    - /home/stock/data:/app/data
+    - /home/stock/logs:/app/logs
+    - /home/stock/reports:/app/reports
     - ../strategies:/app/strategies:ro
     # Longbridge OAuth token cache persistence; entrypoint repairs container-side ownership for dsa user.
     # Create ../longbridge_tokens on the host before copying an authorized token cache into it.
